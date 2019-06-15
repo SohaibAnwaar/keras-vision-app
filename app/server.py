@@ -1,25 +1,21 @@
-from keras.applications.imagenet_utils import preprocess_input, decode_predictions
-from keras.models import load_model
-from keras.preprocessing import image
-from keras.applications.resnet50 import ResNet50
 from starlette.applications import Starlette
 from starlette.responses import HTMLResponse
 from starlette.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
-from pathlib import Path
 import uvicorn, aiohttp, asyncio
-import base64, sys, numpy as np
+from io import BytesIO
+from fastai.vision import *
+import base64
+
+model_file_url = 'https://drive.google.com/open?id=1HWvHeq_IcNsGDSJ64dWObi0E9x4-TSSV'
+model_file_name = 'model'
+classes = ['0', '1', '2', '3', '4']
 
 path = Path(__file__).parent
-model_file_url = 'YOUR MODEL.h5 DIRECT / RAW DOWNLOAD URL HERE!'
-model_file_name = 'model'
 
 app = Starlette()
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_headers=['X-Requested-With', 'Content-Type'])
 app.mount('/static', StaticFiles(directory='app/static'))
-
-MODEL_PATH = path/'models'/f'{model_file_name}.h5'
-IMG_FILE_SRC = '/tmp/saved_image.png'
 
 async def download_file(url, dest):
     if dest.exists(): return
@@ -28,36 +24,35 @@ async def download_file(url, dest):
             data = await response.read()
             with open(dest, 'wb') as f: f.write(data)
 
-async def setup_model():
-    #UNCOMMENT HERE FOR CUSTOM TRAINED MODEL
-    # await download_file(model_file_url, MODEL_PATH)
-    # model = load_model(MODEL_PATH) # Load your Custom trained model
-    # model._make_predict_function()
-    model = ResNet50(weights='imagenet') # COMMENT, IF you have Custom trained model
-    return model
+async def setup_learner():
+    await download_file(model_file_url, path/'models'/f'{model_file_name}.pth')
+    data_bunch = ImageDataBunch.single_from_classes(path, classes, tfms=get_transforms(), size=150).normalize(imagenet_stats)
+    learn = create_cnn(data_bunch, models.resnet34, pretrained=False)
+    learn.load(model_file_name)
+    return learn
 
-# Asynchronous Steps
 loop = asyncio.get_event_loop()
-tasks = [asyncio.ensure_future(setup_model())]
-model = loop.run_until_complete(asyncio.gather(*tasks))[0]
+tasks = [asyncio.ensure_future(setup_learner())]
+learn = loop.run_until_complete(asyncio.gather(*tasks))[0]
 loop.close()
+
+PREDICTION_FILE_SRC = path/'static'/'predictions.txt'
 
 @app.route("/upload", methods=["POST"])
 async def upload(request):
     data = await request.form()
     img_bytes = await (data["img"].read())
     bytes = base64.b64decode(img_bytes)
-    with open(IMG_FILE_SRC, 'wb') as f: f.write(bytes)
-    return model_predict(IMG_FILE_SRC, model)
+    return predict_from_bytes(bytes)
 
-def model_predict(img_path, model):
-    result = []; img = image.load_img(img_path, target_size=(224, 224))
-    x = preprocess_input(np.expand_dims(image.img_to_array(img), axis=0))
-    predictions = decode_predictions(model.predict(x), top=3)[0] # Get Top-3 Accuracy
-    for p in predictions: _,label,accuracy = p; result.append((label,accuracy))
+def predict_from_bytes(bytes):
+    img = open_image(BytesIO(bytes))
+    _,_,losses = learn.predict(img)
+    predictions = sorted(zip(classes, map(float, losses)), key=lambda p: p[1], reverse=True)
     result_html1 = path/'static'/'result1.html'
     result_html2 = path/'static'/'result2.html'
-    result_html = str(result_html1.open().read() +str(result) + result_html2.open().read())
+    
+    result_html = str(result_html1.open().read() +str(predictions[0:3]) + result_html2.open().read())
     return HTMLResponse(result_html)
 
 @app.route("/")
